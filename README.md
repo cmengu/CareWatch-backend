@@ -4,12 +4,10 @@
 
 **Multi-agent monitoring for elderly care** — scores each resident's day against their own routine, explains deviations to family with retrieval-augmented LLM text, and sends Telegram alerts (optional voice reminder) with personal details stripped.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/how-it-works-dark.svg">
-  <img src="docs/how-it-works-light.svg" alt="Left to right: activity log, weighted deviation score that sets the risk level, specialist agents with RAG and an LLM that only write the explanation, alert suppression, Telegram alert. If the LLM fails, stock text is used and the level is unchanged. GREEN sends nothing." width="100%">
-</picture>
+<img src="docs/dashboard-demo.png" alt="CareWatch dashboard in Demo mode: risk index 18, GREEN, weight-based score breakdown, CUSUM drift chart, agent routing panel and today's events for a fictional resident" width="100%">
 
-<sub>Pipeline as wired in <code>src/graph.py</code>: the risk level comes from the score, never from the LLM.</sub>
+<sub>The dashboard (<code>dashboard.html</code>) in Demo mode, captured with Chromium. <b>Everything on this screen is simulated</b>: the resident, the events, the score and the benchmark table are hard-coded in <code>dashboard.html</code> (<code>DEMO_RISK</code>, <code>DEMO_LOGS</code>) and do not come from the detection pipeline. The F1/FNR figures are the unreproduced ones described under Status below.</sub>
+
 
 </div>
 
@@ -30,6 +28,13 @@ The numbers further down were reported by earlier eval runs. They do not reprodu
 ---
 
 ## Architecture
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/how-it-works-dark.svg">
+  <img src="docs/how-it-works-light.svg" alt="Left to right: activity log, weighted deviation score that sets the risk level, specialist agents with RAG and an LLM that only write the explanation, alert suppression, Telegram alert. If the LLM fails, stock text is used and the level is unchanged. GREEN sends nothing." width="100%">
+</picture>
+
+<sub>Pipeline as wired in <code>src/graph.py</code>: the risk level comes from the score, never from the LLM.</sub>
 
 The graph has 11 nodes and runs in a fixed order (`src/graph.py`):
 
@@ -184,6 +189,16 @@ curl -X POST http://localhost:8000/residents/resident_001/scan \
   -F "file=@label_recognition/image1.png"
 # Returns a random mock prescription, e.g. {"medication_name": "Metformin", "dose": "500mg", ...}; the scanner is not real vision yet
 ```
+
+Offline label reading (Tesseract OCR via `label_recognition/preprocess.py`, not the API above) on a sample label with no personal details, and what it returned (`label_recognition/results/image1.json`):
+
+<img src="docs/label-example.png" alt="Sample pharmacy label: 10 tablets, Clavu 125mg amox 500mg tab (Augmentin), take 1 tablet 2 times a day" width="320">
+
+```json
+{ "patient_name": null, "medication_name": "AUGMENTIN", "instructions": "1 TABLET 2 TIMES" }
+```
+
+This is a generic template label, not a real prescription. Other images in `label_recognition/` show real names and are not reproduced here.
 
 ---
 
