@@ -4,9 +4,9 @@
 
 **Multi-agent monitoring for elderly care** — scores each resident's day against their own routine, explains deviations to family with retrieval-augmented LLM text, and sends Telegram alerts (optional voice reminder) with personal details stripped.
 
-<img src="docs/dashboard-demo.png" alt="CareWatch dashboard in Demo mode: risk index 18, GREEN, weight-based score breakdown, CUSUM drift chart, agent routing panel and today's events for a fictional resident" width="100%">
+<img src="docs/dashboard-demo.png" alt="CareWatch dashboard in Demo mode, with a banner saying all data is simulated: risk index 18, weight-based score breakdown and CUSUM drift chart for a fictional resident" width="100%">
 
-<sub>The dashboard (<code>dashboard.html</code>) in Demo mode, captured with Chromium. <b>Everything on this screen is simulated</b>: the resident, the events, the score and the benchmark table are hard-coded in <code>dashboard.html</code> (<code>DEMO_RISK</code>, <code>DEMO_LOGS</code>) and do not come from the detection pipeline. The F1/FNR figures are the unreproduced ones described under Status below.</sub>
+<sub>The dashboard (<code>dashboard.html</code>) in Demo mode, cropped to the resident view. <b>Everything on this screen is simulated</b>: the resident, the events and the score are hard-coded in <code>dashboard.html</code> (<code>DEMO_RISK</code>, <code>DEMO_LOGS</code>) and do not come from the detection pipeline.</sub>
 
 
 </div>
