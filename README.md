@@ -1,123 +1,77 @@
+<div align="center">
+
 # CareWatch
 
-Link to our Monitoring dashboard: https://carewatch-blue.vercel.app/dashboard.html
+**Multi-agent monitoring for elderly care** — scores each resident's day against their own routine, explains deviations to family with retrieval-augmented LLM text, and sends Telegram alerts (optional voice reminder) with personal details stripped.
 
-> Multi-agent AI system for elderly care monitoring. Detects behavioural deviations from personal baselines, generates family-facing explanations via RAG + LLM, fires Telegram alerts with optional TTS delivery, and enforces PDPA-aligned data privacy.
-> **FNR = 0.000 across all 20 eval scenarios. No fall was ever missed.**
+<img src="docs/dashboard-demo.png" alt="CareWatch dashboard in Demo mode, with a banner saying all data is simulated: risk index 18, weight-based score breakdown and CUSUM drift chart for a fictional resident" width="100%">
 
-Built as a production-oriented agentic system using LangGraph. Every architectural decision is measured, not assumed.
+<sub>The dashboard (<code>dashboard.html</code>) in Demo mode, cropped to the resident view. <b>Everything on this screen is simulated</b>: the resident, the events and the score are hard-coded in <code>dashboard.html</code> (<code>DEMO_RISK</code>, <code>DEMO_LOGS</code>) and do not come from the detection pipeline.</sub>
+
+
+</div>
 
 ---
+
+## Why
+
+Families of older people living alone find out about a missed dose or a fall late. CareWatch compares today's logged activity with that resident's own 7-day baseline, so someone who always takes pills at 9pm is not flagged for missing 8am. The alert level is a plain weighted score a clinician can read and adjust; the LLM only writes the message that goes with it.
+
+Monitoring dashboard: https://carewatch-blue.vercel.app/dashboard.html
+
+---
+
+## Status
+
+The numbers further down were reported by earlier eval runs. They do not reproduce at the current HEAD. `DeviationDetector.check()` passes `_today=` to `ActivityLogger.get_today()` (`src/deviation_detector.py:91`), which does not accept it (`src/logger.py:62`). In an offline run (`python -m eval.eval_agent --no-llm`, Python 3.11, no API keys) 14 of 20 scenarios return an error, giving F1 0.857 and FNR 0.250 for all three agents. In `tests/test_merge_integration.py`, TC21, TC22, TC23 and TC26 fail for the same reason and the other four pass. This needs a code fix; the README does not paper over it.
+
 ---
 
 ## Architecture
-```mermaid
-flowchart TD
-    IMG[Pill Bottle Image<br/>optional] --> SN
 
-    subgraph Scan ["Label Scan Layer"]
-        SN[scan_node<br/>MedicationLabelDetector]
-        MSN[med_scan_node<br/>MedScanAgent]
-        CN[chronic_node<br/>ChronicAgent]
-    end
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/how-it-works-dark.svg">
+  <img src="docs/how-it-works-light.svg" alt="Left to right: activity log, weighted deviation score that sets the risk level, specialist agents with RAG and an LLM that only write the explanation, alert suppression, Telegram alert. If the LLM fails, stock text is used and the level is unchanged. GREEN sends nothing." width="100%">
+</picture>
 
-    DB[(activity_log<br/>medication_event<br/>SQLite)] --> DD
+<sub>Pipeline as wired in <code>src/graph.py</code>: the risk level comes from the score, never from the LLM.</sub>
 
-    subgraph Detection ["Detection Layer"]
-        DD[DeviationDetector<br/>weight-based scoring]
-        CUSUM[CUSUM Monitor<br/>gradual drift]
-        DD --> CUSUM
-    end
+The graph has 11 nodes and runs in a fixed order (`src/graph.py`):
 
-    subgraph Orchestrator ["CareWatchOrchestrator — LangGraph 11-node"]
-        direction TB
-        RN{route_node<br/>anomalies to agents}
-        FA[FallAgent<br/>FALLEN · UNCLEARED]
-        MA[MedAgent<br/>pill_taking]
-        RA[RoutineAgent<br/>eating · walking · routine]
-        SA[SummaryAgent<br/>priority merge]
+1. `scan_node` — entry point. Returns immediately unless `image_bytes` is given; otherwise reads a pill-bottle label and records a medication event.
+2. `detect_node` — `DeviationDetector` computes the weighted score and level; the CUSUM drift monitor runs after it and a CUSUM failure is non-fatal.
+3. `route_node` — picks specialists from the anomalies (`route()` in `src/specialist_agents.py`).
+4. `fall_node`, `med_node`, `med_scan_node`, `chronic_node`, `routine_node` — run one after another, not in parallel. Each returns at once if it was not routed. `ChronicAgent` is added whenever `MedAgent` or `MedScanAgent` is. Each specialist retrieves context with `get_context_v2()` and calls the LLM, with a fallback text on failure.
+5. `summary_node` — `SummaryAgent` merges specialist outputs by concern level and agent priority. Risk score and level are copied from the detector.
+6. RED goes through `human_gate_node`, which only sets `human_approved = True` and does not wait for anyone; other levels skip it.
+7. `alert_node` — `AlertSuppressionLayer.send()`, then the audit write to `agent_runs`.
 
-        RN -->|FALLEN / UNCLEARED| FA
-        RN -->|pill_taking| MA
-        RN -->|MED_SCAN| MSN
-        RN -->|pill_taking or MED_SCAN| CN
-        RN -->|eating / walking / routine| RA
-        FA --> SA
-        MA --> SA
-        MSN --> SA
-        CN --> SA
-        RA --> SA
-    end
-
-    subgraph RAG ["RAG 2.0 — Hybrid Retrieval"]
-        direction LR
-        DQ[decompose_queries<br/>per anomaly type]
-        DENSE[ChromaDB<br/>cosine similarity]
-        BM25[BM25<br/>keyword match]
-        RRF[Reciprocal Rank Fusion<br/>k=60]
-        DQ --> DENSE
-        DQ --> BM25
-        DENSE --> RRF
-        BM25 --> RRF
-    end
-
-    subgraph Privacy ["Privacy Layer — PDPA"]
-        PII[strip_pii<br/>before Telegram send]
-        CONSENT[consent_log<br/>SQLite]
-        PSEUDO[pseudonymous_id<br/>sha256 hash]
-    end
-
-    SN -->|image_bytes present| MSN
-    SN --> DD
-    CUSUM --> RN
-    RRF -->|domain context| FA
-    RRF -->|domain context| MA
-    RRF -->|domain context| MSN
-    RRF -->|domain context| CN
-    RRF -->|domain context| RA
-
-    SA -->|RED| HG[human_gate_node<br/>caregiver review]
-    SA -->|YELLOW / GREEN| AL
-
-    HG -->|/clear| AL[AlertSuppressionLayer<br/>4hr dedup window]
-    AL --> PII
-    PII --> TG[Telegram Alert<br/>family notification]
-    AL -->|voice_alert=True| TTS[TTS Reminder<br/>pyttsx3]
-    AL --> AUD[(agent_runs<br/>SQLite audit log)]
-
-    style Scan fill:#3a2a1a,color:#fff,stroke:#ffaa44
-    style Detection fill:#1e3a5f,color:#fff,stroke:#4a9eff
-    style Orchestrator fill:#1a3a2a,color:#fff,stroke:#4aff88
-    style RAG fill:#3a1a3a,color:#fff,stroke:#cc88ff
-    style Privacy fill:#3a1a1a,color:#fff,stroke:#ff6666
-```
-
-Three agent implementations share the same `run()` interface and are benchmarked against identical eval scenarios:
+Three agent implementations share the same `run()` interface and are benchmarked on the same scenarios:
 
 | Agent | Architecture | Role |
 |-------|-------------|------|
-| `CareWatchAgent` | Custom linear pipeline | Production baseline |
-| `CareWatchOrchestrator` | LangGraph multi-agent | Production (Phase 3+) |
+| `CareWatchAgent` | Custom linear pipeline | Baseline; uses `get_context()` |
+| `CareWatchOrchestrator` | LangGraph multi-agent | The graph above |
 | `CareWatchLangChainAgent` | LangChain tool-calling | Eval comparison |
 
 ---
 
-## What's New 
-
-Four capabilities that have now been added:
+## Added later
 
 | Capability | Implementation | Entry point |
 |---|---|---|
-| CV medication label scanner | `src/label_detector.py` — mock path; swap `extract_from_image()` for Gemini/GPT-4o | `scan_node` in graph |
-| Chronic illness inference | `src/chronic_detector.py` — local KB + Groq/SEA-LION fallback | `ChronicAgent` co-fires with `MedAgent` |
-| TTS reminders | `src/tts.py` — pyttsx3, cross-platform | `voice_alert=True` on `graph.invoke()` |
+| Medication label scanner | `src/label_detector.py` — returns random mock prescriptions; swap `extract_from_image()` for a vision API | `scan_node` in graph |
+| Chronic illness inference | `src/chronic_detector.py` — local KB, then Groq/SEA-LION fallback | `ChronicAgent` co-fires with `MedAgent` |
+| TTS reminders | `src/tts.py` — pyttsx3 | `voice_alert=True` on `graph.invoke()` |
 | PDPA privacy layer | `src/privacy.py` — pseudonymous IDs, PII stripping, consent log, retention | `strip_pii()` before every Telegram send |
 
-The graph grew from 8 nodes to 11. `scan_node` is now the entry point and is a no-op when `image_bytes` is absent — all existing runs are unaffected.
+The graph grew from 8 nodes to 11. `scan_node` is the entry point and is a no-op when `image_bytes` is absent.
 
 ---
 
 ## Evaluation Results
+
+Reported by earlier runs; see Status above for what happens at HEAD.
 
 ### Agent Comparison (20 deterministic scenarios, `--no-llm` mode)
 
@@ -127,27 +81,31 @@ The graph grew from 8 nodes to 11. `scan_node` is now the entry point and is a n
 | LangGraph multi-agent | 1.000 | 0.000 | 95% | 454ms | 2424ms | TBD |
 | LangChain | 1.000 | 0.000 | 95% | 1ms | 9ms | TBD |
 
-**FNR = 0.000** — no fall or active alert was missed across all 20 eval scenarios. In a safety system, a missed detection is the worst possible outcome.
+These were not reproduced. The machine and date of the original run were not recorded. In `--no-llm` mode no LLM runs, so the LLM Alignment column cannot come from that mode.
 
-**LangGraph p95 = 2424ms** vs custom p95 = 2ms. The overhead is graph initialisation and MemorySaver across 11 nodes — not LLM latency. The architectural fix is an early-exit edge from `detect_node → alert_node` on GREEN, skipping the full graph for the ~80% of residents who are fine on any given day.
+Positive class for F1 and FNR is expected level RED (`eval/eval_agent.py`). FNR is the share of expected-RED scenarios the system did not call RED.
+
+The LangGraph p95 gap against the custom agent was attributed to graph setup and MemorySaver across 11 nodes, not to LLM latency. That was not re-measured. A possible fix is an early-exit edge from `detect_node` to `alert_node` on GREEN; the graph has no such edge today.
 
 ### Integration Test Suite (8 scenarios, pytest)
 
-| Test | What it proves |
-|---|---|
-| TC21 — scan_node no-op | `image_bytes=None` produces no scan_result, pipeline unchanged |
-| TC22 — scan_node processes image | `image_bytes` → `scan_result` with medication_name, confidence, meal_relation |
-| TC23 — scan writes DB | `medication_event` row written for scanned medication |
-| TC24 — ChronicAgent T2DM | 10 Metformin events → "Type 2 Diabetes" in family alert summary |
-| TC25 — insufficient history | 1 event → graceful "Insufficient history" without error |
-| TC26 — low-confidence scan | confidence < 0.75 → `concern_level=watch`, manual verification requested |
-| TC27 — PII stripped | Real names never appear in Telegram payload |
-| TC28 — TTS fires | `voice_alert=True` → `speak()` called exactly once on YELLOW/RED |
+| Test | What it checks | At HEAD |
+|---|---|---|
+| TC21 — scan_node no-op | `image_bytes=None` produces no scan_result | fails |
+| TC22 — scan_node processes image | `image_bytes` gives `scan_result` with medication_name, confidence, meal_relation | fails |
+| TC23 — scan writes DB | `medication_event` row written for scanned medication | fails |
+| TC24 — ChronicAgent T2DM | 10 Metformin events give "Type 2 Diabetes" in family alert summary | passes |
+| TC25 — insufficient history | 1 event gives "Insufficient history" without error | passes |
+| TC26 — low-confidence scan | confidence < 0.75 gives `concern_level=watch`, manual verification requested | fails |
+| TC27 — PII stripped | Real names never appear in Telegram payload | passes |
+| TC28 — TTS fires | `voice_alert=True` calls `speak()` once on YELLOW/RED | passes |
 ```bash
 python -m pytest tests/test_merge_integration.py -v
 ```
 
-### Pipeline Metrics (Phase 2 — with LLM)
+### Pipeline Metrics (Phase 2, with LLM)
+
+Reported by an earlier run with a Groq key; not reproducible without one.
 
 | Metric | Score |
 |--------|-------|
@@ -161,21 +119,22 @@ python -m pytest tests/test_merge_integration.py -v
 
 ### Prompt Variant Comparison
 
-| Variant | Style | Alignment | FNR | p50 | Safe |
-|---------|-------|-----------|-----|-----|------|
-| A1C1 | Decision table + self-check (baseline) | 95% | 0.000 | 229ms | ✅ |
-| A2C1 | Chain-of-thought + self-check | 100% | 0.000 | 232ms | ✅ |
-| A1C3 | Decision table + no self-check | 100% | 0.000 | 214ms | ✅ |
+| Variant | Style | Alignment | FNR | p50 |
+|---------|-------|-----------|-----|-----|
+| A1C1 | Decision table + self-check (baseline) | 95% | 0.000 | 229ms |
+| A2C1 | Chain-of-thought + self-check | 100% | 0.000 | 232ms |
+| A1C3 | Decision table + no self-check | 100% | 0.000 | 214ms |
 
-Chain-of-thought (A2C1) achieves 100% alignment at the same latency. The separate self-check call added ~5 seconds with no measurable safety benefit at `temperature=0.3`.
+Not reproduced. The separate self-check call was reported to add about 5 seconds with no measurable safety benefit at `temperature=0.3`. A1C1 is still the default variant (`src/prompt_registry.py:9`, `:41-46`), so the separate self-check still runs unless another variant is passed.
 
 ### RAG Retrieval (25 ground-truth queries)
+
+The raw ChromaDB numbers are in `eval/results/rag_eval_20260316_103151.json`: MRR 0.960, Precision@1 0.92, zero-hit queries 0, over 25 queries. That file also lists Recall@2 and Recall@3 as 1.08, which cannot be right for a recall; the metric is miscounted. The hybrid MRR of 0.933 is not in any committed result file.
 
 | Metric | Raw (ChromaDB only) | Hybrid (BM25 + dense RRF) |
 |--------|--------------------|-----------------------------|
 | MRR | 0.960 | 0.933 |
-| Precision@1 | 0.920 | — |
-| Recall@3 | 1.080 | — |
+| Precision@1 | 0.920 | not reported |
 | Zero-hit queries | 0 | 0 |
 
 ---
@@ -184,25 +143,24 @@ Chain-of-thought (A2C1) achieves 100% alignment at the same latency. The separat
 
 Standard RAG: `embed → store → single query → top-k docs → LLM`.
 
-The problem: a resident with a fall AND missed medication produces the query `"fallen FALLEN pill_taking MISSING"` — semantically diluted, excellent for neither.
+The problem: a resident with a fall and a missed medication produces the query `"fallen FALLEN pill_taking MISSING"`, which is semantically diluted and retrieves neither topic well.
 
-**Phase 4 upgraded this to:**
+Phase 4 changed this to:
 ```
 anomalies → _decompose_queries()     → ["fall detection emergency response...",
                                          "missed medication dosing window..."]
-         → _hybrid_retrieve() × N   → BM25 + ChromaDB cosine → RRF merge
+         → _hybrid_retrieve() × N   → BM25 + ChromaDB cosine → RRF merge (k=60)
          → _rerank()                 → cross-encoder stub (upgrade path documented)
          → deduplicated context      → LLM
 ```
 
-Each anomaly type maps to a domain-specific semantic query. Two anomaly types → two independent retrievals → merged via RRF. Architecture is in place; cross-encoder swap is one function body change.
+Each anomaly type maps to a domain-specific query. Two anomaly types give two independent retrievals merged with RRF. The specialist agents in the LangGraph path call this (`src/specialist_agents.py:82`); the custom agent still calls `get_context()`. Swapping in a real cross-encoder is a change to the `_rerank()` body.
 
 ---
-
 ## Quick Start
 ```bash
-git clone https://github.com/your-handle/carewatch
-cd carewatch
+git clone https://github.com/cmengu/carewatch-backend
+cd carewatch-backend
 cp .env.example .env          # add GROQ_API_KEY, CAREWATCH_BOT_TOKEN, CAREWATCH_CHAT_ID
 python generate_mock_data.py   # populate DB before first run
 docker-compose up              # starts pipeline + telegram listener
@@ -229,8 +187,18 @@ Scan a medication label via API:
 python app/api.py &
 curl -X POST http://localhost:8000/residents/resident_001/scan \
   -F "file=@label_recognition/image1.png"
-# Returns: {"medication_name": "Metformin", "dose": "500mg", "meal_relation": "after", "confidence": 0.94}
+# Returns a random mock prescription, e.g. {"medication_name": "Metformin", "dose": "500mg", ...}; the scanner is not real vision yet
 ```
+
+Offline label reading (Tesseract OCR via `label_recognition/preprocess.py`, not the API above) on a sample label with no personal details, and what it returned (`label_recognition/results/image1.json`):
+
+<img src="docs/label-example.png" alt="Sample pharmacy label: 10 tablets, Clavu 125mg amox 500mg tab (Augmentin), take 1 tablet 2 times a day" width="320">
+
+```json
+{ "patient_name": null, "medication_name": "AUGMENTIN", "instructions": "1 TABLET 2 TIMES" }
+```
+
+This is a generic template label, not a real prescription. Other images in `label_recognition/` show real names and are not reproduced here.
 
 ---
 
@@ -243,19 +211,19 @@ A weighted sum (pill missing = 40pts, meal missing = 25pts, timing deviation = u
 CUSUM accumulates small deviations before alerting, catching gradual decline (a resident eating less over 10 days) that a rolling z-score would miss until the deviation became large. Tradeoff: CUSUM state is in-memory and resets on process restart. Fix: persist accumulators to SQLite.
 
 **3. Hybrid RAG (dense + sparse) over embedding-only retrieval.**
-ChromaDB cosine similarity retrieves semantically related documents but misses exact clinical token matches (e.g. drug names). BM25 keyword search covers the exact-match case. RRF merges both ranked lists without requiring a common score scale. At 47 facts, dense wins; at 10k+ facts, hybrid wins — the architecture scales.
+ChromaDB cosine similarity retrieves semantically related documents but misses exact clinical token matches (e.g. drug names). BM25 keyword search covers the exact-match case. RRF merges both ranked lists without requiring a common score scale. At the current corpus size dense scored higher; the claim that hybrid wins at 10k+ facts has not been tested.
 
-**4. Separate self-check call removed.**
-Phase 2 eval showed the second Groq API call added ~5 seconds with no measurable alignment or safety benefit at `temperature=0.3`. A single chain-of-thought prompt achieves 100% alignment at 214ms p50.
+**4. Self-check variants.**
+An earlier eval reported the second Groq call adding ~5 seconds with no measurable benefit at `temperature=0.3`, so variants without it exist (A1C2, A1C3). The default, A1C1, still uses the separate call.
 
 **5. AlertSuppressionLayer to prevent alert fatigue.**
-A 4-hour suppression window ensures families receive at most one Telegram alert per incident. Alert fatigue causes families to ignore notifications — defeating the system's purpose. Tradeoff: a new anomaly within the suppression window for a different reason may be delayed.
+A repeat of the same level is suppressed for 5 minutes (RED) or 30 minutes (YELLOW), and a rise in level always fires (`src/suppression.py:17-22`). Alert fatigue causes families to ignore notifications — defeating the system's purpose. Tradeoff: a new anomaly of the same level within the window, for a different reason, is muted.
 
 **6. Personalised baselines per resident over population norms.**
-A resident who always takes pills at 9pm generates false positives under a population norm expecting 8am. Per-resident 7-day rolling baselines calibrate detection to individual routines.
+A resident who always takes pills at 9pm generates false positives under a population norm expecting 8am. Per-resident baselines built from the last 7 days of logs (`src/baseline_builder.py:54`) calibrate detection to individual routines.
 
 **7. Groq (llama-3.3-70b-versatile) over GPT-4o.**
-Sub-300ms p50 inference vs ~800ms for GPT-4o on this prompt size. The concern-level classification task does not require GPT-4o's reasoning depth — a well-structured chain-of-thought prompt achieves 100% alignment on llama-3.3-70b. Tradeoff: Groq free tier has a 100k token/day limit.
+Reported p50 of 229ms (see Pipeline Metrics); the ~800ms GPT-4o figure was not measured in this repo. The concern-level classification task does not require GPT-4o's reasoning depth — a well-structured chain-of-thought prompt achieves 100% alignment on llama-3.3-70b. Tradeoff: Groq free tier has a 100k token/day limit.
 
 **8. scan_node as graph entry point, no-op when image absent.**
 Making scan_node the entry point rather than a conditional branch means the graph structure is identical for all runs. When `image_bytes` is None, scan_node returns immediately and the pipeline is identical to pre-merge behaviour. A separate scan graph was rejected because it would duplicate the suppression and alert logic.
@@ -288,7 +256,7 @@ PDPA requires that personal data is protected in transmission, not necessarily a
 
 **CUSUM state resets on restart.** Trend detection is in-memory. A gradual decline being tracked is lost on process restart. Fix: persist CUSUM accumulators to SQLite on each check.
 
-**Human-gate deferred.** `CareWatchOrchestrator.resume()` raises `NotImplementedError`. The LangGraph interrupt architecture is wired — re-enabling requires adding a `thread_id` column to `alert_store` and updating the Telegram listener to call `resume()` on `/clear`.
+**Human-gate deferred.** `human_gate_node` sets a flag and does not pause the graph. `CareWatchOrchestrator.resume()` raises `NotImplementedError`. The LangGraph interrupt architecture is wired — re-enabling requires adding a `thread_id` column to `alert_store` and updating the Telegram listener to call `resume()` on `/clear`.
 
 **Telegram send failures are not retried.** A failed delivery is logged but not queued. Fix: `alert_send_queue` table polled by a background thread every 30 seconds.
 
@@ -296,7 +264,7 @@ PDPA requires that personal data is protected in transmission, not necessarily a
 
 **ChronicAgent LLM fallback requires API key.** When a medication is not in the local knowledge base, `ChronicDetector.infer_from_name()` falls back to Groq then SEA-LION. `SEA_LION_API_KEY` is not yet in `.env.example`.
 
-**`get_context_v2()` is opt-in.** Hybrid retrieval MRR (0.933) came in below raw MRR (0.960) at 47 documents — BM25 adds noise at this corpus size. The hybrid path exists and is tested; it becomes the default once a real cross-encoder replaces the `_rerank()` stub.
+**Hybrid retrieval scored lower than raw.** A reported hybrid MRR of 0.933 against 0.960 raw suggests BM25 adds noise at this corpus size, yet the specialist agents already use `get_context_v2()`. The `_rerank()` step is still a stub.
 
 ---
 
